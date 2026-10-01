@@ -1,0 +1,21 @@
+{
+  "name": "mra-chain-service",
+  "version": "1.0.0",
+  "description": "MRA e-invoicing chain service: issues invoiceCounter and per-type previousNoteHash, race-free",
+  "scripts": {
+    "dev": "node --env-file=.env scripts/dev.js",
+    "migrate": "node --env-file=.env scripts/migrate.js",
+    "create-tenant": "node --env-file=.env scripts/create-tenant.js",
+    "test": "node --test test/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^4.22.3",
+    "pg": "^8.23.1"
+  },
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  }
+}

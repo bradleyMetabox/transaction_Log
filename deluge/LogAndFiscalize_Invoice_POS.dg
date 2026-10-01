@@ -1,0 +1,1569 @@
+/* =====================================================================
+   LogAndFiscalize_Invoice_POS — Zoho POS workflow (on invoice create)
+   ---------------------------------------------------------------------
+   Log the sale in the MRA chain service (one call: it returns the
+   invoiceCounter + previousNoteHash, race-free), fiscalise from those
+   values, report the outcome back to the service, and record it in
+   cm_successful_fiscalization / cm_failed_fiscalization.
+   The Zoho cm_transaction_log module is no longer written: the chain
+   service IS the transaction log.
+
+   ZOHO POS SPECIFICS
+   - API base: https://api.zakya.com/inventory/v1 (US data centre).
+     Every call goes through ONE connection: "connectpos"
+     (Zoho POS service, ZohoPOSAPI.* scopes incl. invoices, contacts,
+     settings and custom modules). The Books connection does not work here.
+   - Custom fields come back as a custom_fields LIST (label / api_name /
+     value), not a hash. They are flattened into a map keyed by BOTH the
+     api_name and the label, so cf_field_mapping may use either.
+   - Payment method: mapped field -> the invoice's own payments
+     (largest payment's mode) -> unpaid balance = CREDIT.
+   - Branch: cf_branch_configuration is keyed by location_id; falls back
+     to the invoice / first line warehouse_id (POS outlet).
+   - API budget: POS allows 1,500-2,500 calls/day. A new sale costs about
+     7 Zoho calls (config 2, payments 1-2, invoice update 1, outcome record
+     1-2) + 2 chain-service calls + the middleware POST. No chain scan.
+   - Returns a result map (header_context/data, code 0) - required by the
+     POS function editor, and shown to the user when run from a button.
+     The same outcome is in the execution log ("DBG" lines + a final
+     "RESULT" line) and in the modules.
+
+   Flow: config -> invoice -> type -> log in chain service (create or
+   reuse, frozen chain values) -> validate -> transmit -> report outcome.
+   Master switch gates TRANSMISSION only; logging always happens.
+   ===================================================================== */
+Map LogAndFiscalize_Invoice_POS(Map invoice, Map organization, Map user)
+{
+	posBase = "https://api.zakya.com/inventory/v1";
+	jsonHeaders = Map();
+	jsonHeaders.put("Content-Type","application/json");
+	// Options of the invoice dropdown cf_fiscalization_status - must match the POS field EXACTLY.
+	STATUS_FISCALIZED = "Fiscalized";
+	STATUS_FAILED = "Failed Fiscalization";
+	// Payment method comes from the PAYMENT RECEIVED against the invoice. When none is recorded yet:
+	//   false (safe default) = do not transmit, the sale fails and is retried once the payment exists;
+	//   true = an unpaid balance is sent as CREDIT (only for clients that sell on account).
+	NO_PAYMENT_MEANS_CREDIT = false;
+	// MRA chain service (issues invoiceCounter + previousNoteHash). The config fields
+	// cf_chain_service_url / cf_chain_service_key override these when they exist and are filled.
+	CHAIN_SERVICE_URL = "https://YOUR-PROJECT.vercel.app";
+	CHAIN_SERVICE_KEY = "";
+	organizationID = organization.get("organization_id");
+	invoiceID = invoice.get("invoice_id");
+	invoiceNumber = toString(invoice.get("invoice_number"));
+	stop = false;
+	stopMsg = "";
+	failed = false;
+	failErr = "";
+	// DEBUG: every info line starts with "DBG" (search "DBG" to find or strip them).
+	// "stage" stops moving at the first failure, so the final line names where it failed.
+	stage = "0. start";
+	info "DBG [0] start: invoice " + invoiceNumber + " (id " + invoiceID + "), org " + organizationID;
+
+	// ============ 1. CONFIG (list -> detail -> flatten) ============
+	stage = "1. config";
+	apiEndpoint = "";
+	tolerance = 0.05;
+	fiscEnabled = true;
+	trainingTemplateID = "";
+	branchCfg = Map();
+	prefixCfg = Map();
+	sellerCfg = Map();
+	tanField = "cf_tan";
+	brnField = "cf_brn";
+	invoiceTypeField = "cf_invoice_type";
+	nidField = "cf_nid";
+	customerTypeField = "cf_customer_type";
+	taxStatusField = "cf_customer_tax_status";
+	paymentField = "cf_payment_method";
+	cfgResp = invokeurl
+	[
+		url :posBase + "/cm_e_invoicing_configuration?organization_id=" + organizationID + "&per_page=1"
+		type :GET
+		connection:"connectpos"
+	];
+	cfgRecords = ifnull(cfgResp.get("module_records"),List());
+	if(cfgRecords.size() == 0)
+	{
+		info "DBG [1] config query returned no record. Raw response: " + cfgResp;
+	}
+	else
+	{
+		cfgRecordId = cfgRecords.get(0).get("module_record_id");
+		cfgDetailResp = invokeurl
+		[
+			url :posBase + "/cm_e_invoicing_configuration/" + cfgRecordId + "?organization_id=" + organizationID
+			type :GET
+			connection:"connectpos"
+		];
+		cfgDetail = ifnull(cfgDetailResp.get("module_record"),Map());
+		flatCfg = cfgRecords.get(0);
+		cfgFields = ifnull(cfgDetail.get("module_fields"),List());
+		for each  mf in cfgFields
+		{
+			fApi = ifnull(mf.get("api_name"),"");
+			if(fApi != "")
+			{
+				flatCfg.put(fApi,ifnull(mf.get("value"),""));
+			}
+		}
+		apiEndpoint = toString(ifnull(flatCfg.get("cf_api_endpoint"),"")).trim();
+		tolRaw = toString(ifnull(flatCfg.get("cf_reconciliation_tolerance"),"0.05")).trim();
+		if(tolRaw.isNumber())
+		{
+			tolerance = tolRaw.toDecimal();
+		}
+		if(toString(ifnull(flatCfg.get("cf_fiscalization_enabled"),"true")) == "false")
+		{
+			fiscEnabled = false;
+		}
+		trainingTemplateID = toString(ifnull(flatCfg.get("cf_training_template_id"),"")).trim();
+		branchRaw = toString(ifnull(flatCfg.get("cf_branch_configuration"),""));
+		if(branchRaw.trim() != "")
+		{
+			pB = branchRaw.toMap();
+			if(pB != null)
+			{
+				branchCfg = pB;
+			}
+		}
+		prefixRaw = toString(ifnull(flatCfg.get("cf_document_prefixes"),""));
+		if(prefixRaw.trim() != "")
+		{
+			pP = prefixRaw.toMap();
+			if(pP != null)
+			{
+				prefixCfg = pP;
+			}
+		}
+		fieldMapRaw = toString(ifnull(flatCfg.get("cf_field_mapping"),""));
+		if(fieldMapRaw.trim() != "")
+		{
+			fieldMap = fieldMapRaw.toMap();
+			if(fieldMap != null)
+			{
+				tanField = ifnull(fieldMap.get("tan"),"cf_tan");
+				brnField = ifnull(fieldMap.get("brn"),"cf_brn");
+				invoiceTypeField = ifnull(fieldMap.get("invoice_type"),"cf_invoice_type");
+				nidField = ifnull(fieldMap.get("nid"),"cf_nid");
+				customerTypeField = ifnull(fieldMap.get("customer_type"),"cf_customer_type");
+				taxStatusField = ifnull(fieldMap.get("tax_status"),"cf_customer_tax_status");
+				paymentField = ifnull(fieldMap.get("payment_method"),"cf_payment_method");
+			}
+		}
+		cfgChainUrl = toString(ifnull(flatCfg.get("cf_chain_service_url"),"")).trim();
+		if(cfgChainUrl != "")
+		{
+			CHAIN_SERVICE_URL = cfgChainUrl;
+		}
+		cfgChainKey = toString(ifnull(flatCfg.get("cf_chain_service_key"),"")).trim();
+		if(cfgChainKey != "")
+		{
+			CHAIN_SERVICE_KEY = cfgChainKey;
+		}
+		sellerCfgRaw = toString(ifnull(flatCfg.get("cf_seller_details"),""));
+		if(sellerCfgRaw.trim() != "")
+		{
+			pSeller = sellerCfgRaw.toMap();
+			if(pSeller != null)
+			{
+				sellerCfg = pSeller;
+			}
+		}
+	}
+	branchKeys = branchCfg.keys();
+	prefixKeys = prefixCfg.keys();
+	info "DBG [1] config: record found=" + cfgRecords.size() + ", endpoint='" + apiEndpoint + "', enabled=" + toString(fiscEnabled) + ", tolerance=" + tolerance;
+	info "DBG [1] config: branches=" + branchKeys + ", prefixes=" + prefixKeys + ", seller keys=" + sellerCfg.keys();
+	if(CHAIN_SERVICE_URL.endsWith("/"))
+	{
+		CHAIN_SERVICE_URL = CHAIN_SERVICE_URL.subString(0,CHAIN_SERVICE_URL.length() - 1);
+	}
+	info "DBG [1] chain service: " + CHAIN_SERVICE_URL + ", key set=" + toString(CHAIN_SERVICE_KEY != "");
+	info "DBG [1] field map: type=" + invoiceTypeField + ", brn=" + brnField + ", tan=" + tanField + ", nid=" + nidField + ", customerType=" + customerTypeField + ", taxStatus=" + taxStatusField + ", payment=" + paymentField;
+
+	// ============ 2. INVOICE (workflow map if complete, else one GET) ============
+	stage = "2. invoice";
+	fullInv = Map();
+	invSource = "workflow map";
+	if(invoice.containsKey("line_items") && invoice.get("line_items") != null)
+	{
+		fullInv = invoice;
+	}
+	else
+	{
+		invSource = "API";
+		fullResp = invokeurl
+		[
+			url :posBase + "/invoices/" + invoiceID + "?organization_id=" + organizationID
+			type :GET
+			connection:"connectpos"
+		];
+		fullInv = ifnull(fullResp.get("invoice"),Map());
+		if(fullInv.isEmpty())
+		{
+			failed = true;
+			failErr = "Could not load invoice " + invoiceNumber + " from Zoho POS: " + ifnull(fullResp.get("message"),"no response") + " (code " + fullResp.get("code") + ").";
+			if(toString(fullResp.get("code")) == "57")
+			{
+				failErr = failErr + " The connectpos connection is not authorised for organisation " + organizationID + " - authorise it with an admin of this POS organisation and the ZohoPOSAPI scopes.";
+			}
+		}
+	}
+	// Custom fields: flatten hash (if any) + list, keyed by api_name AND label.
+	invCF = Map();
+	currencyCode = "MUR";
+	fxToMur = 1.0;
+	invoiceTotalDec = 0.0;
+	invoiceTotal = "0.0";
+	customerID = "";
+	if(!failed)
+	{
+		invHash = fullInv.get("custom_field_hash");
+		if(invHash != null)
+		{
+			invHashKeys = invHash.keys();
+			for each  hk in invHashKeys
+			{
+				invCF.put(hk,invHash.get(hk));
+			}
+		}
+		invCfList = ifnull(fullInv.get("custom_fields"),List());
+		for each  cfi in invCfList
+		{
+			cfVal = ifnull(cfi.get("value"),"");
+			cfApi = toString(ifnull(cfi.get("api_name"),""));
+			cfLbl = toString(ifnull(cfi.get("label"),""));
+			if(cfApi != "")
+			{
+				invCF.put(cfApi,cfVal);
+			}
+			if(cfLbl != "")
+			{
+				invCF.put(cfLbl,cfVal);
+			}
+		}
+		currencyCode = ifnull(fullInv.get("currency_code"),"MUR");
+		fxRaw = ifnull(fullInv.get("exchange_rate"),"1").toString();
+		if(fxRaw.isNumber() && fxRaw.toDecimal() > 0)
+		{
+			fxToMur = fxRaw.toDecimal();
+		}
+		// Canonical amount string: computed ONCE, stored as TEXT on the log, hashed verbatim.
+		docTotalRaw = ifnull(fullInv.get("total"),"0").toString();
+		if(docTotalRaw.isNumber())
+		{
+			invoiceTotalDec = docTotalRaw.toDecimal().round(2);
+		}
+		invoiceTotal = invoiceTotalDec.toString();
+		customerID = toString(ifnull(fullInv.get("customer_id"),""));
+		info "DBG [2] invoice (" + invSource + "): total=" + invoiceTotal + " " + currencyCode + ", fx=" + fxToMur + ", customer=" + customerID + ", location=" + fullInv.get("location_id") + ", warehouse=" + fullInv.get("warehouse_id") + ", inclusive=" + fullInv.get("is_inclusive_tax");
+		info "DBG [2] invoice: lines=" + ifnull(fullInv.get("line_items"),List()).size() + ", balance=" + fullInv.get("balance") + ", adjustment=" + fullInv.get("adjustment") + ", discount=" + fullInv.get("discount") + ", discount_amount=" + fullInv.get("discount_amount") + ", created_time=" + fullInv.get("created_time");
+		info "DBG [2] invoice custom fields: " + invCF;
+		info "DBG [2] invoice keys: " + fullInv.keys();
+		dbgLines = ifnull(fullInv.get("line_items"),List());
+		if(dbgLines.size() > 0)
+		{
+			info "DBG [2] line_items[0] keys: " + dbgLines.get(0).keys();
+		}
+	}
+	else
+	{
+		info "DBG [2] " + failErr;
+	}
+
+	// ============ 3. (log lookup now happens in the chain service, step 8) ============
+	logExistedAtStart = false;
+
+	// ============ 4. MRA TYPE — resolved once, used for both chain and payload ============
+	if(!failed && !stop)
+	{
+		stage = "4. type resolution";
+	}
+	invoiceTypeDesc = "";
+	if(!stop && !failed)
+	{
+		rawType = toString(ifnull(invCF.get(invoiceTypeField),"")).trim();
+		if(rawType == "Standard")
+		{
+			invoiceTypeDesc = "STD";
+		}
+		else if(rawType == "Training")
+		{
+			invoiceTypeDesc = "TRN";
+		}
+		else if(rawType == "Debit Note")
+		{
+			invoiceTypeDesc = "DRN";
+		}
+		// Field unset: the configured number series decides (longest prefix wins).
+		if(invoiceTypeDesc == "" && !prefixCfg.isEmpty())
+		{
+			pmKey = "";
+			for each  pKey in prefixKeys
+			{
+				if(invoiceNumber.startsWith(toString(pKey)) && toString(pKey).length() > pmKey.length())
+				{
+					pmKey = toString(pKey);
+				}
+			}
+			if(pmKey != "")
+			{
+				pmType = toString(ifnull(prefixCfg.get(pmKey).get("type"),""));
+				if(pmType == "STD" || pmType == "TRN" || pmType == "DRN")
+				{
+					invoiceTypeDesc = pmType;
+					info "DBG [4] no usable " + invoiceTypeField + "; prefix '" + pmKey + "' resolves it to " + pmType;
+				}
+			}
+		}
+		// Last resort: a debit-note number series.
+		if(invoiceTypeDesc == "")
+		{
+			numPrefix = invoiceNumber.toUpperCase();
+			if(numPrefix.contains("-"))
+			{
+				numPrefix = numPrefix.subString(0,numPrefix.indexOf("-"));
+			}
+			if(numPrefix.contains("DEBIT") || numPrefix.contains("DEBN") || numPrefix.contains("DRN") || numPrefix.contains("DN"))
+			{
+				invoiceTypeDesc = "DRN";
+				info "DBG [4] the number series identifies it as a Debit Note";
+			}
+		}
+		if(!failed && invoiceTypeDesc == "")
+		{
+			failed = true;
+			failErr = "Invoice type unresolved: no usable '" + invoiceTypeField + "' field, and '" + invoiceNumber + "' matches no prefix in cf_document_prefixes. For POS sales add the register series, e.g. {\"SI-\":{\"type\":\"STD\",\"module\":\"invoices\"}}.";
+		}
+	}
+	typeLabel = "Standard Invoice";
+	if(invoiceTypeDesc == "DRN")
+	{
+		typeLabel = "Debit Note";
+	}
+	else if(invoiceTypeDesc == "TRN")
+	{
+		typeLabel = "Training Invoice";
+	}
+	info "DBG [4] type: resolved='" + invoiceTypeDesc + "', chain label='" + typeLabel + "', failed=" + toString(failed);
+
+	// ============ 5. TRAINING: template + TRN number, before anything is logged ============
+	if(!failed && !stop)
+	{
+		stage = "5. training";
+	}
+	if(!stop && !failed && invoiceTypeDesc == "TRN")
+	{
+		if(trainingTemplateID != "" && toString(fullInv.get("template_id")) != trainingTemplateID)
+		{
+			tplMap = Map();
+			tplMap.put("template_id",trainingTemplateID);
+			tplResp = invokeurl
+			[
+				url :posBase + "/invoices/" + invoiceID + "?organization_id=" + organizationID
+				type :PUT
+				parameters:tplMap.toString()
+				headers:jsonHeaders
+				connection:"connectpos"
+			];
+			info "DBG [5] TRN template switch: " + tplResp.get("code") + " " + tplResp.get("message");
+		}
+		if(!invoiceNumber.startsWith("TRN"))
+		{
+			if(invoiceNumber.contains("INV"))
+			{
+				newInvoiceNumber = invoiceNumber.replaceFirst("INV","TRN");
+				renameMap = Map();
+				renameMap.put("invoice_number",newInvoiceNumber);
+				renameResp = invokeurl
+				[
+					url :posBase + "/invoices/" + invoiceID + "?ignore_auto_number_generation=true&organization_id=" + organizationID
+					type :PUT
+					parameters:renameMap.toString()
+					headers:jsonHeaders
+					connection:"connectpos"
+				];
+				if(renameResp.get("code") == 0)
+				{
+					info "DBG [5] TRN number rename: " + invoiceNumber + " -> " + newInvoiceNumber;
+					invoiceNumber = newInvoiceNumber;
+				}
+				else
+				{
+					failed = true;
+					failErr = "Training invoice could not be renumbered " + invoiceNumber + " -> " + newInvoiceNumber + ": " + renameResp.get("message");
+				}
+			}
+			else
+			{
+				info "DBG [5] TRN: " + invoiceNumber + " has no 'INV' to replace; number kept as is.";
+			}
+		}
+	}
+
+	// ============ 6. NUMBER SERIES must agree with the type (config-driven) ============
+	if(!failed && !stop)
+	{
+		stage = "6. prefix validation";
+	}
+	if(!stop && !failed && !prefixCfg.isEmpty())
+	{
+		matchedKey = "";
+		for each  pKey in prefixKeys
+		{
+			if(invoiceNumber.startsWith(toString(pKey)) && toString(pKey).length() > matchedKey.length())
+			{
+				matchedKey = toString(pKey);
+			}
+		}
+		if(matchedKey == "")
+		{
+			failed = true;
+			failErr = "Number series '" + invoiceNumber + "' matches no prefix in configuration (cf_document_prefixes).";
+		}
+		else
+		{
+			expectedType = toString(ifnull(prefixCfg.get(matchedKey).get("type"),""));
+			if(expectedType != invoiceTypeDesc)
+			{
+				failed = true;
+				failErr = "Invoice Type " + invoiceTypeDesc + " does not match number series '" + matchedKey + "' (" + expectedType + ").";
+			}
+		}
+		info "DBG [6] prefix check: matched='" + matchedKey + "', failed=" + toString(failed);
+	}
+
+	// ============ 7. BUYER (contact, field-mapped) ============
+	if(!failed && !stop)
+	{
+		stage = "7. buyer";
+	}
+	brn = "";
+	tanValue = "";
+	nidValue = "";
+	rawTaxStatus = "";
+	rawCustomerType = "";
+	contactBillAddr = Map();
+	// MetaBox Technology - POS walk-in sales carry no real buyer. The "Walk-in Customer"
+	// contact is treated as an individual consumer who is not VAT registered, whatever is
+	// (or is not) set on the contact, and its contact record is not read at all.
+	customerNameRaw = toString(ifnull(fullInv.get("customer_name"),"")).trim();
+	isWalkIn = (customerNameRaw.toLowerCase() == "walk-in customer");
+	if(!stop && !failed && isWalkIn)
+	{
+		rawCustomerType = "Individual Consumer - [B2C]";
+		rawTaxStatus = "Non VAT Registered Person - [NVTR]";
+		info "DBG [7] walk-in sale ('" + customerNameRaw + "'): customer type and tax status hard-coded to B2C / NVTR; contact not read.";
+	}
+	if(!stop && !failed && customerID != "" && !isWalkIn)
+	{
+		customerResp = invokeurl
+		[
+			url :posBase + "/contacts/" + customerID + "?organization_id=" + organizationID
+			type :GET
+			connection:"connectpos"
+		];
+		customer = customerResp.get("contact");
+		if(customer == null)
+		{
+			info "DBG [7] contact load failed - raw response: " + customerResp;
+		}
+		else
+		{
+			custCF = Map();
+			custHash = customer.get("custom_field_hash");
+			if(custHash != null)
+			{
+				custHashKeys = custHash.keys();
+				for each  ck in custHashKeys
+				{
+					custCF.put(ck,custHash.get(ck));
+				}
+			}
+			custCfList = ifnull(customer.get("custom_fields"),List());
+			for each  ccf in custCfList
+			{
+				ccVal = ifnull(ccf.get("value"),"");
+				ccApi = toString(ifnull(ccf.get("api_name"),""));
+				ccLbl = toString(ifnull(ccf.get("label"),""));
+				if(ccApi != "")
+				{
+					custCF.put(ccApi,ccVal);
+				}
+				if(ccLbl != "")
+				{
+					custCF.put(ccLbl,ccVal);
+				}
+			}
+			rawCustomerType = toString(ifnull(custCF.get(customerTypeField),""));
+			rawTaxStatus = toString(ifnull(custCF.get(taxStatusField),""));
+			// Sanitised here so the logged BRN, the hashed BRN and the transmitted BRN are one string.
+			brn = toString(ifnull(custCF.get(brnField),"")).trim().replaceAll("\\\\","").replaceAll("\"","");
+			tanValue = toString(ifnull(custCF.get(tanField),"")).replaceAll("[^0-9]","");
+			nidValue = toString(ifnull(custCF.get(nidField),"")).trim();
+			contactBillAddr = ifnull(customer.get("billing_address"),Map());
+			info "DBG [7] contact custom fields: " + custCF;
+		}
+	}
+	info "DBG [7] buyer: customerType='" + rawCustomerType + "', taxStatus='" + rawTaxStatus + "', brn='" + brn + "', tan='" + tanValue + "', nid set=" + toString(nidValue != "");
+
+	// ============ 8. LOG IN THE CHAIN SERVICE (one call) ============
+	// The service locks this client's chain, so back-to-back sales can never share a hash.
+	// A sale that is already logged gets back its frozen counter/hash/date; if its number,
+	// total or BRN changed, the service refreshes it only while nothing is chained to it.
+	if(!failed && !stop)
+	{
+		stage = "8. chain service log";
+	}
+	logCounter = "";
+	logHash = "";
+	logDateTime = "";
+	logNumber = "";
+	logTotal = "";
+	logBrn = "";
+	chainHeaders = Map();
+	chainHeaders.put("Content-Type","application/json");
+	chainHeaders.put("x-api-key",CHAIN_SERVICE_KEY);
+	if(!stop && !failed)
+	{
+		// Issued date/time: invoice date + the time part of its immutable created_time.
+		formattedDate = "";
+		if(fullInv.containsKey("date") && fullInv.get("date") != null)
+		{
+			issuedDate = fullInv.get("date").toDate();
+			if(issuedDate != null)
+			{
+				issuedTime = "00:00:00";
+				createdRaw = ifnull(fullInv.get("created_time"),"").toString();
+				if(createdRaw.contains("T") && createdRaw.length() >= 19)
+				{
+					tPos = createdRaw.indexOf("T");
+					issuedTime = createdRaw.subString(tPos + 1,tPos + 9);
+				}
+				formattedDate = issuedDate.toString("yyyy-MM-dd") + " " + issuedTime;
+			}
+		}
+		if(formattedDate == "")
+		{
+			failed = true;
+			failErr = "Invoice date could not be read.";
+		}
+		else if(CHAIN_SERVICE_KEY == "" || CHAIN_SERVICE_URL.contains("YOUR-PROJECT"))
+		{
+			failed = true;
+			failErr = "Chain service not configured: set CHAIN_SERVICE_URL / CHAIN_SERVICE_KEY at the top of this function (or cf_chain_service_url / cf_chain_service_key in the configuration).";
+		}
+	}
+	if(!stop && !failed)
+	{
+		chainBody = Map();
+		chainBody.put("systemId",toString(invoiceID));
+		chainBody.put("type",invoiceTypeDesc);
+		chainBody.put("number",invoiceNumber);
+		chainBody.put("totalAmount",invoiceTotal);
+		chainBody.put("brn",brn);
+		chainBody.put("currency",currencyCode);
+		chainBody.put("issuedDateTime",formattedDate);
+		chainResp = invokeurl
+		[
+			url :CHAIN_SERVICE_URL + "/v1/transactions"
+			type :POST
+			parameters:chainBody.toString()
+			headers:chainHeaders
+			detailed:true
+		];
+		chainCode = toString(ifnull(chainResp.get("responseCode"),""));
+		chainText = ifnull(chainResp.get("responseText"),"");
+		chainData = Map();
+		if(chainText.toString().startsWith("{"))
+		{
+			chainData = chainText.toString().toMap();
+		}
+		info "DBG [8] chain service HTTP " + chainCode + ": " + chainText;
+		if(toString(chainData.get("ok")) == "true" && chainData.get("transaction") != null)
+		{
+			tx = chainData.get("transaction");
+			logCounter = toString(tx.get("counter"));
+			logHash = toString(ifnull(tx.get("previousNoteHash"),""));
+			logDateTime = toString(ifnull(tx.get("issuedDateTime"),""));
+			logNumber = toString(ifnull(tx.get("number"),""));
+			logTotal = toString(ifnull(tx.get("totalAmount"),""));
+			logBrn = toString(ifnull(tx.get("brn"),""));
+			logExistedAtStart = (toString(chainData.get("created")) != "true");
+			if(chainData.get("warning") != null)
+			{
+				info "DBG [8] chain service warning: " + chainData.get("warning") + " " + chainData.get("changes");
+			}
+			if(toString(tx.get("status")) == "FISCALIZED")
+			{
+				stop = true;
+				stopMsg = logNumber + " SKIPPED: already fiscalised (IRN " + tx.get("irn") + ", counter " + logCounter + ").";
+			}
+			else if(logHash == "" || logDateTime.length() != 19 || logNumber == "" || logTotal == "")
+			{
+				failed = true;
+				failErr = "Chain service returned an incomplete transaction (counter " + logCounter + ") - not transmitted.";
+			}
+		}
+		else if(chainData.get("error") != null)
+		{
+			chainErr = chainData.get("error");
+			failed = true;
+			failErr = "Chain service " + chainErr.get("code") + ": " + chainErr.get("message");
+		}
+		else
+		{
+			failed = true;
+			failErr = "Chain service unreachable or unexpected answer (HTTP " + chainCode + ") - not logged, nothing transmitted.";
+		}
+	}
+	info "DBG [8] logged: counter='" + logCounter + "', hash='" + logHash + "', date='" + logDateTime + "', number='" + logNumber + "', total='" + logTotal + "', brn='" + logBrn + "', new=" + toString(!logExistedAtStart);
+
+	// ============ 10. MASTER SWITCH (transmission only — the sale above is already logged) ============
+	if(!failed && !stop)
+	{
+		stage = "10. master switch";
+	}
+	if(!stop && !failed && !fiscEnabled)
+	{
+		stop = true;
+		stopMsg = invoiceNumber + " logged (counter " + logCounter + "); transmission is paused in configuration.";
+	}
+
+	// ============ 11. PAYLOAD VALIDATIONS (all before any transmission) ============
+	if(!failed && !stop)
+	{
+		stage = "11. payload validations";
+	}
+	transactionTypeForPayload = "";
+	if(rawCustomerType.contains("[") && rawCustomerType.contains("]"))
+	{
+		transactionTypeForPayload = rawCustomerType.subString(rawCustomerType.lastIndexOf("[") + 1,rawCustomerType.lastIndexOf("]")).trim();
+	}
+	else if(rawCustomerType == "B2B" || rawCustomerType == "B2C" || rawCustomerType == "B2G" || rawCustomerType == "EXP" || rawCustomerType == "B2E")
+	{
+		transactionTypeForPayload = rawCustomerType;
+	}
+	else if(rawCustomerType == "Business")
+	{
+		transactionTypeForPayload = "B2B";
+	}
+	else if(rawCustomerType == "Government")
+	{
+		transactionTypeForPayload = "B2G";
+	}
+	else if(rawCustomerType == "Individual Consumer")
+	{
+		transactionTypeForPayload = "B2C";
+	}
+	else if(rawCustomerType == "Zero-Rated Supplies/Exports")
+	{
+		transactionTypeForPayload = "EXP";
+	}
+	else if(rawCustomerType == "Exempt Bodies")
+	{
+		transactionTypeForPayload = "B2E";
+	}
+	typeOfBuyer = rawTaxStatus;
+	if(rawTaxStatus.contains("[") && rawTaxStatus.contains("]"))
+	{
+		typeOfBuyer = rawTaxStatus.subString(rawTaxStatus.lastIndexOf("[") + 1,rawTaxStatus.lastIndexOf("]")).trim();
+	}
+	// DRN: reference invoice required; reason from native field.
+	reasonStated = "";
+	invoiceRefNumberForPayload = "";
+	paySourceDoc = fullInv;
+	if(!stop && !failed && invoiceTypeDesc == "DRN")
+	{
+		reasonStated = toString(ifnull(fullInv.get("reason_for_debit_note"),""));
+		refOk = false;
+		if(fullInv.containsKey("reference_invoice") && fullInv.get("reference_invoice") != null)
+		{
+			refInvoice = fullInv.get("reference_invoice");
+			invoiceRefNumberForPayload = toString(ifnull(refInvoice.get("reference_invoice_number"),""));
+			refInvoiceId = toString(ifnull(refInvoice.get("reference_invoice_id"),""));
+			if(refInvoiceId != "")
+			{
+				refResp = invokeurl
+				[
+					url :posBase + "/invoices/" + refInvoiceId + "?organization_id=" + organizationID
+					type :GET
+					connection:"connectpos"
+				];
+				if(refResp.get("code") == 0)
+				{
+					paySourceDoc = refResp.get("invoice");
+					refOk = true;
+				}
+			}
+		}
+		if(!refOk)
+		{
+			failed = true;
+			failErr = "Reference invoice not found or missing for Debit Note.";
+		}
+	}
+	// Branch: first outlet-like field present on the invoice, then on its first line.
+	// If none is present and exactly ONE branch is configured, that branch is used.
+	branchSourceId = "";
+	branchSourceField = "";
+	docBranchFields = "location_id,branch_id,outlet_id,register_id,store_id,warehouse_id".toList(",");
+	for each  bf in docBranchFields
+	{
+		bfVal = toString(ifnull(fullInv.get(bf),"")).trim();
+		if(bfVal != "" && bfVal != "null")
+		{
+			branchSourceId = bfVal;
+			branchSourceField = bf;
+			break;
+		}
+	}
+	if(branchSourceId == "")
+	{
+		invLines = ifnull(fullInv.get("line_items"),List());
+		if(invLines.size() > 0)
+		{
+			firstLine = invLines.get(0);
+			lineBranchFields = "location_id,branch_id,warehouse_id".toList(",");
+			for each  lbf in lineBranchFields
+			{
+				lbfVal = toString(ifnull(firstLine.get(lbf),"")).trim();
+				if(lbfVal != "" && lbfVal != "null")
+				{
+					branchSourceId = lbfVal;
+					branchSourceField = "line_items[0]." + lbf;
+					break;
+				}
+			}
+		}
+	}
+	apiKey = "";
+	branchCode = "";
+	if(!stop && !failed)
+	{
+		locCfg = null;
+		for each  bKey in branchKeys
+		{
+			if(toString(bKey).trim() == branchSourceId)
+			{
+				locCfg = branchCfg.get(bKey);
+				break;
+			}
+		}
+		if(locCfg == null && branchKeys.size() == 1)
+		{
+			locCfg = branchCfg.get(branchKeys.get(0));
+			info "DBG [11] branch: no match for '" + branchSourceId + "' - using the only configured branch " + branchKeys.get(0);
+			branchSourceField = "single configured branch";
+			branchSourceId = toString(branchKeys.get(0));
+		}
+		if(locCfg == null)
+		{
+			failed = true;
+			failErr = "No branch configuration matches this invoice (" + if(branchSourceField == "","no outlet/location field on the invoice",branchSourceField + " '" + branchSourceId + "'") + "). Add it as a key in cf_branch_configuration.";
+		}
+		else
+		{
+			apiKey = toString(ifnull(locCfg.get("apiKey"),""));
+			branchCode = toString(ifnull(locCfg.get("ebsCounterNo"),""));
+			if(apiKey == "" || branchCode == "")
+			{
+				failed = true;
+				failErr = "Branch configuration for " + branchSourceId + " is missing apiKey or ebsCounterNo.";
+			}
+		}
+	}
+	if(!stop && !failed && apiEndpoint == "")
+	{
+		failed = true;
+		failErr = "cf_api_endpoint is empty in e-Invoicing Configuration.";
+	}
+	// Payment method = payment_mode of the PAYMENT RECEIVED against this invoice, used as-is
+	// (the POS payment modes are the MRA codes). Split payment: the largest payment decides.
+	// Read from GET /invoices/{id}/payments; if that endpoint answers nothing, from the invoice's
+	// payments list; a payment without a mode is opened (GET /customerpayments/{payment_id}).
+	// A debit note with no payment of its own falls back to its reference invoice's payments.
+	salesTransaction = "";
+	paymentSource = "";
+	if(!stop && !failed)
+	{
+		payLookupIds = List();
+		payLookupIds.add(toString(invoiceID));
+		if(invoiceTypeDesc == "DRN" && paySourceDoc.get("invoice_id") != null && toString(paySourceDoc.get("invoice_id")) != toString(invoiceID))
+		{
+			payLookupIds.add(toString(paySourceDoc.get("invoice_id")));
+		}
+		bestAmt = -1.0;
+		bestMode = "";
+		bestPaymentNo = "";
+		modesSeen = List();
+		for each  payDocId in payLookupIds
+		{
+			if(bestMode == "")
+			{
+				payResp = invokeurl
+				[
+					url :posBase + "/invoices/" + payDocId + "/payments?organization_id=" + organizationID
+					type :GET
+					connection:"connectpos"
+				];
+				payList = payResp.get("payments");
+				if(payList == null)
+				{
+					info "DBG [11] invoice payments endpoint for " + payDocId + " returned: " + payResp;
+					detResp = invokeurl
+					[
+						url :posBase + "/invoices/" + payDocId + "?organization_id=" + organizationID
+						type :GET
+						connection:"connectpos"
+					];
+					payList = ifnull(ifnull(detResp.get("invoice"),Map()).get("payments"),List());
+				}
+				for each  pay in payList
+				{
+					pMode = toString(ifnull(pay.get("payment_mode"),"")).trim();
+					payId = toString(ifnull(pay.get("payment_id"),""));
+					if(pMode == "" && payId != "")
+					{
+						cpResp = invokeurl
+						[
+							url :posBase + "/customerpayments/" + payId + "?organization_id=" + organizationID
+							type :GET
+							connection:"connectpos"
+						];
+						pMode = toString(ifnull(ifnull(cpResp.get("payment"),Map()).get("payment_mode"),"")).trim();
+					}
+					pAmtRaw = toString(ifnull(pay.get("amount"),"0"));
+					pAmt = 0.0;
+					if(pAmtRaw.isNumber())
+					{
+						pAmt = pAmtRaw.toDecimal();
+					}
+					pNo = toString(ifnull(pay.get("payment_number"),payId));
+					modesSeen.add(pNo + ": " + pMode + " " + pAmtRaw);
+					if(pMode != "" && pAmt > bestAmt)
+					{
+						bestAmt = pAmt;
+						bestMode = pMode;
+						bestPaymentNo = pNo;
+					}
+				}
+			}
+		}
+		info "DBG [11] payments received: " + modesSeen;
+		if(bestMode != "")
+		{
+			salesTransaction = bestMode.trim().toUpperCase();
+			paymentSource = "payment received " + bestPaymentNo + " -> '" + bestMode + "'";
+		}
+		else
+		{
+			balRaw = toString(ifnull(fullInv.get("balance"),"0"));
+			if(NO_PAYMENT_MEANS_CREDIT && balRaw.isNumber() && balRaw.toDecimal() > 0)
+			{
+				salesTransaction = "CREDIT";
+				paymentSource = "no payment received, unpaid balance " + balRaw;
+			}
+		}
+		salesTransaction = salesTransaction.toUpperCase();
+		if(transactionTypeForPayload == "")
+		{
+			failed = true;
+			failErr = "Customer Type missing or untagged (no [B2B]/[B2C]/... resolvable from '" + customerTypeField + "') for customer: " + ifnull(fullInv.get("customer_name"),"") + ".";
+		}
+		else if(salesTransaction != "CASH" && salesTransaction != "BNKTRANSFER" && salesTransaction != "CHEQUE" && salesTransaction != "CARD" && salesTransaction != "OTHER" && salesTransaction != "CREDIT")
+		{
+			failed = true;
+			if(salesTransaction == "")
+			{
+				failErr = "No payment received on this invoice yet, so the payment method is unknown - not transmitted. It will go through on retry once the payment is recorded.";
+			}
+			else
+			{
+				failErr = "Payment mode '" + salesTransaction + "' (" + paymentSource + ") is not an MRA code - the payment mode must be CASH, CARD, CHEQUE, BNKTRANSFER, CREDIT or OTHER.";
+			}
+		}
+		else if(transactionTypeForPayload == "B2B" || transactionTypeForPayload == "B2G")
+		{
+			// Empty TAN allowed on purpose: MRA accepts a non-VAT-registered B2B buyer without TAN
+			// as long as buyerType says NVTR.
+			if(typeOfBuyer == "")
+			{
+				failed = true;
+				failErr = "Buyer tax status (buyerType) missing - required for " + transactionTypeForPayload + ". Customer: " + ifnull(fullInv.get("customer_name"),"");
+			}
+			else if(tanValue.length() > 8)
+			{
+				failed = true;
+				failErr = "Buyer TAN has more than the 8 digits MRA allows (value: " + tanValue + "). Customer: " + ifnull(fullInv.get("customer_name"),"");
+			}
+			else if(transactionTypeForPayload == "B2B" && logBrn.trim() == "")
+			{
+				failed = true;
+				failErr = "Buyer BRN missing - required for B2B. Customer: " + ifnull(fullInv.get("customer_name"),"");
+			}
+		}
+	}
+	// Seller: config-first, organisation-label fallback. Guarded BEFORE the payload is built.
+	sellerName = "";
+	sellerTradeName = "";
+	sellerTan = "";
+	sellerBrn = "";
+	typeOfSeller = "";
+	sellerAddr = "";
+	sellerPhone = "";
+	if(!stop && !failed)
+	{
+		sellerName = toString(ifnull(sellerCfg.get("name"),""));
+		sellerTradeName = toString(ifnull(sellerCfg.get("tradeName"),""));
+		sellerTan = toString(ifnull(sellerCfg.get("tan"),""));
+		sellerBrn = toString(ifnull(sellerCfg.get("brn"),""));
+		typeOfSeller = toString(ifnull(sellerCfg.get("personType"),""));
+		sellerAddr = toString(ifnull(sellerCfg.get("businessAddr"),""));
+		sellerPhone = toString(ifnull(sellerCfg.get("businessPhoneNo"),""));
+		if(sellerName == "" || sellerTradeName == "" || sellerTan == "" || sellerBrn == "" || typeOfSeller == "")
+		{
+			orgCF = organization.get("custom_fields");
+			if(orgCF != null)
+			{
+				orgCFList = orgCF.toList();
+				for each  fld in orgCFList
+				{
+					lbl = fld.get("label");
+					if(lbl == "Seller Name" && sellerName == "")
+					{
+						sellerName = toString(ifnull(fld.get("value"),""));
+					}
+					else if(lbl == "Seller Trade Name" && sellerTradeName == "")
+					{
+						sellerTradeName = toString(ifnull(fld.get("value"),""));
+					}
+					else if(lbl == "Seller TAN" && sellerTan == "")
+					{
+						sellerTan = toString(ifnull(fld.get("value"),""));
+					}
+					else if(lbl == "Seller BRN" && sellerBrn == "")
+					{
+						sellerBrn = toString(ifnull(fld.get("value"),""));
+					}
+					else if(lbl == "Seller Type" && typeOfSeller == "")
+					{
+						typeOfSeller = toString(ifnull(fld.get("value"),""));
+					}
+				}
+			}
+		}
+		if(sellerName == "" || sellerTan == "" || sellerBrn == "" || typeOfSeller == "")
+		{
+			sellerMissing = List();
+			if(sellerName == "")
+			{
+				sellerMissing.add("name");
+			}
+			if(sellerTan == "")
+			{
+				sellerMissing.add("tan");
+			}
+			if(sellerBrn == "")
+			{
+				sellerMissing.add("brn");
+			}
+			if(typeOfSeller == "")
+			{
+				sellerMissing.add("personType");
+			}
+			failed = true;
+			failErr = "Seller identity incomplete - missing " + sellerMissing.toString(", ") + ". Set cf_seller_details in the e-Invoicing Configuration.";
+		}
+		if(sellerAddr == "")
+		{
+			orgAddr = ifnull(organization.get("address"),Map());
+			for each  part in {ifnull(orgAddr.get("street_address1"),""),ifnull(orgAddr.get("city"),""),ifnull(orgAddr.get("country"),"")}
+			{
+				if(part != "")
+				{
+					if(sellerAddr != "")
+					{
+						sellerAddr = sellerAddr + ", ";
+					}
+					sellerAddr = sellerAddr + part;
+				}
+			}
+		}
+		if(sellerPhone == "")
+		{
+			sellerPhone = toString(ifnull(organization.get("phone"),""));
+		}
+		sellerPhone = sellerPhone.replaceAll("[^0-9+]","");
+	}
+	info "DBG [11] buyer: transactionType='" + transactionTypeForPayload + "', buyerType='" + typeOfBuyer + "', payment='" + salesTransaction + "' (from " + paymentSource + "), DRN ref='" + invoiceRefNumberForPayload + "'";
+	info "DBG [11] branch: " + branchSourceField + "='" + branchSourceId + "', ebsCounterNo='" + branchCode + "', apiKey length=" + apiKey.length();
+	info "DBG [11] seller: name='" + sellerName + "', tan='" + sellerTan + "', brn='" + sellerBrn + "', type='" + typeOfSeller + "', phone='" + sellerPhone + "'";
+	info "DBG [11] validations failed=" + toString(failed) + (if(failed," -> " + failErr,""));
+
+	// ============ 12. ITEMS + SHIPPING + ADJUSTMENT (inclusive-aware) + RECONCILIATION ============
+	if(!failed && !stop)
+	{
+		stage = "12. lines / reconciliation";
+	}
+	isInclusive = (ifnull(fullInv.get("is_inclusive_tax"),"false").toString() == "true");
+	itemList = List();
+	sumExclusive = 0.0;
+	sumVat = 0.0;
+	negAdjToDiscount = 0.0;
+	if(!stop && !failed)
+	{
+		lineItems = ifnull(fullInv.get("line_items"),List());
+		for each  li in lineItems
+		{
+			itemTotal = ifnull(li.get("item_total"),"0").toDecimal();
+			taxPct = ifnull(li.get("tax_percentage"),"0").toDecimal();
+			rawTaxName = toString(ifnull(li.get("tax_name"),""));
+			taxCode = "";
+			if(rawTaxName.contains("[") && rawTaxName.contains("]"))
+			{
+				taxCode = rawTaxName.subString(rawTaxName.lastIndexOf("[") + 1,rawTaxName.lastIndexOf("]")).trim();
+			}
+			else if(rawTaxName == "TC01" || rawTaxName == "TC02" || rawTaxName == "TC03" || rawTaxName == "TC04" || rawTaxName == "TC05" || rawTaxName == "TC06")
+			{
+				taxCode = rawTaxName;
+			}
+			if(taxCode == "")
+			{
+				failed = true;
+				failErr = "Untagged/unknown tax on line '" + ifnull(li.get("name"),"") + "': '" + rawTaxName + "'. Add [TC0#] to the tax name.";
+				break;
+			}
+			vat = 0.0;
+			lineTaxes = ifnull(li.get("line_item_taxes"),List());
+			if(lineTaxes.size() > 0)
+			{
+				vat = ifnull(lineTaxes.get(0).get("tax_amount"),"0").toDecimal();
+			}
+			else if(taxPct > 0)
+			{
+				vat = itemTotal * taxPct / 100;
+			}
+			vat = vat.round(2);
+			rate = ifnull(li.get("rate"),"0").toDecimal();
+			unitPrice = rate;
+			if(isInclusive && taxPct > 0)
+			{
+				unitPrice = rate / (1 + taxPct / 100);
+			}
+			unitPrice = unitPrice.round(2);
+			discAmt = ifnull(li.get("discount_amount"),"0").toDecimal();
+			discRaw = toString(ifnull(li.get("discount"),"0")).replaceAll("%","").trim();
+			discPct = 0.0;
+			if(discRaw.isNumber())
+			{
+				discPct = discRaw.toDecimal() / 100;
+			}
+			itemDescPrimary = toString(ifnull(li.get("name"),"")).trim();
+			itemDescBackup = toString(ifnull(li.get("description"),"")).trim();
+			if(invoiceTypeDesc == "DRN")
+			{
+				itemDescPrimary = toString(ifnull(li.get("description"),"")).trim();
+				itemDescBackup = toString(ifnull(li.get("name"),"")).trim();
+			}
+			itemDescRaw = itemDescPrimary;
+			if(itemDescRaw == "")
+			{
+				itemDescRaw = itemDescBackup;
+			}
+			itemDescClean = itemDescRaw.replaceAll("\\\\","").replaceAll("\"","in");
+			if(itemDescClean.length() > 90)
+			{
+				itemDescClean = itemDescClean.left(90);
+			}
+			itm = Map();
+			itm.put("itemNo",(itemList.size() + 1).toString());
+			itm.put("taxCode",taxCode);
+			itm.put("nature",if(ifnull(li.get("item_type_formatted"),"").contains("Service"),"SERVICES","GOODS"));
+			itm.put("currency",ifnull(li.get("currency_code"),currencyCode));
+			itm.put("productCodeMra","");
+			if(invoiceTypeDesc == "DRN")
+			{
+				itm.put("productCodeOwn","DRN-ITEM");
+			}
+			else
+			{
+				itm.put("productCodeOwn",ifnull(li.get("item_id"),""));
+			}
+			itm.put("itemDesc",itemDescClean);
+			itm.put("quantity",li.get("quantity").toString());
+			itm.put("unitPrice",unitPrice.toString());
+			itm.put("discount",discPct.toString());
+			itm.put("discountedValue",discAmt.toString());
+			itm.put("amtWoVatCur",itemTotal.toString());
+			itm.put("amtWoVatMur",(itemTotal * fxToMur).round(2).toString());
+			itm.put("vatAmt",vat.toString());
+			itm.put("totalPrice",(itemTotal + vat).toString());
+			itemList.add(itm);
+			info "DBG [12] line " + itemList.size() + ": '" + itemDescClean + "' tax=" + taxCode + " qty=" + li.get("quantity") + " unitPrice=" + unitPrice + " amtWoVat=" + itemTotal + " vat=" + vat + " disc=" + discAmt;
+			sumExclusive = sumExclusive + itemTotal;
+			sumVat = sumVat + vat;
+		}
+	}
+	if(!stop && !failed)
+	{
+		shipChargeRaw = ifnull(fullInv.get("shipping_charge"),"0").toString();
+		shipCharge = 0.0;
+		if(shipChargeRaw.isNumber())
+		{
+			shipCharge = shipChargeRaw.toDecimal();
+		}
+		if(shipCharge != 0)
+		{
+			shipTaxRaw = ifnull(fullInv.get("shipping_charge_tax"),"0").toString();
+			shipVat = 0.0;
+			if(shipTaxRaw.isNumber())
+			{
+				shipVat = shipTaxRaw.toDecimal().round(2);
+			}
+			rawShipTax = toString(ifnull(fullInv.get("shipping_charge_tax_name"),""));
+			shipTaxCode = "";
+			if(rawShipTax.contains("[") && rawShipTax.contains("]"))
+			{
+				shipTaxCode = rawShipTax.subString(rawShipTax.lastIndexOf("[") + 1,rawShipTax.lastIndexOf("]")).trim();
+			}
+			else if(rawShipTax == "TC01" || rawShipTax == "TC02" || rawShipTax == "TC03" || rawShipTax == "TC04" || rawShipTax == "TC05" || rawShipTax == "TC06")
+			{
+				shipTaxCode = rawShipTax;
+			}
+			if(shipTaxCode == "")
+			{
+				failed = true;
+				failErr = "Untagged/unknown shipping tax: '" + rawShipTax + "'. Add [TC0#] to the tax name.";
+			}
+			else
+			{
+				s = Map();
+				s.put("itemNo",(itemList.size() + 1).toString());
+				s.put("taxCode",shipTaxCode);
+				s.put("nature","SERVICES");
+				s.put("currency",currencyCode);
+				s.put("productCodeMra","");
+				s.put("productCodeOwn","SHIPPING");
+				s.put("itemDesc","Shipping Charge");
+				s.put("quantity","1");
+				s.put("unitPrice",shipCharge.round(2).toString());
+				s.put("discount","0");
+				s.put("discountedValue","0");
+				s.put("amtWoVatCur",shipCharge.round(2).toString());
+				s.put("amtWoVatMur",(shipCharge * fxToMur).round(2).toString());
+				s.put("vatAmt",shipVat.toString());
+				s.put("totalPrice",(shipCharge + shipVat).round(2).toString());
+				itemList.add(s);
+				sumExclusive = sumExclusive + shipCharge;
+				sumVat = sumVat + shipVat;
+			}
+		}
+	}
+	if(!stop && !failed)
+	{
+		adjRaw = ifnull(fullInv.get("adjustment"),"0").toString();
+		adj = 0.0;
+		if(adjRaw.isNumber())
+		{
+			adj = adjRaw.toDecimal();
+		}
+		// Positive adjustment stays a line. Negative cannot be a line (MRA unitPrice is unsigned):
+		// |adj| goes to discountTotalAmount.
+		if(adj > 0)
+		{
+			aj = Map();
+			aj.put("itemNo",(itemList.size() + 1).toString());
+			aj.put("taxCode","TC06");
+			aj.put("nature","SERVICES");
+			aj.put("currency",currencyCode);
+			aj.put("productCodeMra","");
+			aj.put("productCodeOwn","ADJUSTMENT");
+			aj.put("itemDesc",toString(ifnull(fullInv.get("adjustment_description"),"Adjustment")).replaceAll("\\\\","").replaceAll("\"","in"));
+			aj.put("quantity","1");
+			aj.put("unitPrice",adj.round(2).toString());
+			aj.put("discount","0");
+			aj.put("discountedValue","0");
+			aj.put("amtWoVatCur",adj.round(2).toString());
+			aj.put("amtWoVatMur",(adj * fxToMur).round(2).toString());
+			aj.put("vatAmt","0");
+			aj.put("totalPrice",adj.round(2).toString());
+			itemList.add(aj);
+			sumExclusive = sumExclusive + adj;
+		}
+		else if(adj < 0)
+		{
+			negAdjToDiscount = 0.0 - adj;
+		}
+	}
+	docDiscount = 0.0;
+	if(!stop && !failed)
+	{
+		// Document-level rebate only (line discounts are already net in item_total).
+		// POS may give it as discount_amount, or as a plain amount in "discount" (a "%" value is ignored).
+		docDiscountRaw = ifnull(fullInv.get("discount_amount"),"").toString();
+		if(docDiscountRaw.isNumber())
+		{
+			docDiscount = docDiscountRaw.toDecimal();
+		}
+		else
+		{
+			docDiscAlt = ifnull(fullInv.get("discount"),"0").toString().trim();
+			if(!docDiscAlt.contains("%") && docDiscAlt.isNumber())
+			{
+				docDiscount = docDiscAlt.toDecimal();
+			}
+		}
+		expected = (sumExclusive + sumVat - docDiscount - negAdjToDiscount).round(2);
+		diff = expected - invoiceTotalDec;
+		if(diff < 0.0)
+		{
+			diff = 0.0 - diff;
+		}
+		info "DBG [12] recon: sumExclusive=" + sumExclusive + ", sumVat=" + sumVat + ", docDiscount=" + docDiscount + ", negAdj=" + negAdjToDiscount + ", expected=" + expected + ", invoice total=" + invoiceTotalDec + ", diff=" + diff + ", tolerance=" + tolerance;
+		if(diff > tolerance)
+		{
+			failed = true;
+			failErr = "Totals mismatch: lines (" + expected.toString() + ") vs invoice total (" + invoiceTotal + "). Unmapped charge - not transmitted.";
+		}
+	}
+
+	// ============ 13. TRANSMIT (payload chain fields come from the chain service) ============
+	if(!failed && !stop)
+	{
+		stage = "13. transmit";
+	}
+	info "DBG [13] ready to transmit=" + toString(!stop && !failed) + ", lines=" + itemList.size();
+	irn = "";
+	if(!stop && !failed)
+	{
+		// Buyer address: invoice billing address, else the contact's.
+		buyerAddr = "";
+		billAddr = ifnull(fullInv.get("billing_address"),Map());
+		if(ifnull(billAddr.get("address"),"") == "" && ifnull(billAddr.get("city"),"") == "")
+		{
+			billAddr = contactBillAddr;
+		}
+		for each  part in {ifnull(billAddr.get("address"),""),ifnull(billAddr.get("city"),""),ifnull(billAddr.get("country"),"")}
+		{
+			if(part != "")
+			{
+				if(buyerAddr != "")
+				{
+					buyerAddr = buyerAddr + ", ";
+				}
+				buyerAddr = buyerAddr + part;
+			}
+		}
+		salesperson = toString(ifnull(fullInv.get("salesperson_name"),""));
+		cashierID = "SP-0000";
+		if(salesperson.contains("|"))
+		{
+			cashierID = salesperson.subString(salesperson.indexOf("|") + 1).trim().replaceAll("\\\\","").replaceAll("\"","");
+		}
+		invMap = Map();
+		invMap.put("invoiceCounter",logCounter);
+		invMap.put("previousNoteHash",logHash);
+		invMap.put("invoiceIdentifier",logNumber);
+		invMap.put("invoiceRefIdentifier",invoiceRefNumberForPayload);
+		invMap.put("invoiceTypeDesc",invoiceTypeDesc);
+		invMap.put("reasonStated",reasonStated.replaceAll("\\\\","").replaceAll("\"",""));
+		invMap.put("transactionType",transactionTypeForPayload);
+		invMap.put("salesTransactions",salesTransaction);
+		invMap.put("personType",typeOfSeller);
+		invMap.put("currency",currencyCode);
+		invMap.put("totalVatAmount",sumVat.round(2).toString());
+		invMap.put("totalAmtWoVatCur",sumExclusive.round(2).toString());
+		invMap.put("totalAmtWoVatMur",(sumExclusive * fxToMur).round(2).toString());
+		// MRA: invoiceTotal = totalAmtWoVatCur + totalVatAmount; totalAmtPaid = invoiceTotal - discountTotalAmount.
+		// totalAmtPaid is the LOGGED total string, verbatim — the next document hashes this exact value.
+		payloadInvoiceTotal = (sumExclusive + sumVat).round(2);
+		invMap.put("invoiceTotal",payloadInvoiceTotal.toString());
+		invMap.put("totalAmtPaid",logTotal);
+		invMap.put("discountTotalAmount",(docDiscount + negAdjToDiscount).round(2).toString());
+		invMap.put("dateTimeInvoiceIssued",logDateTime.replaceAll("-",""));
+		sellerMap = Map();
+		sellerMap.put("name",sellerName.replaceAll("\\\\","").replaceAll("\"",""));
+		sellerMap.put("tradeName",sellerTradeName.replaceAll("\\\\","").replaceAll("\"",""));
+		sellerMap.put("tan",sellerTan.replaceAll("\\\\","").replaceAll("\"",""));
+		sellerMap.put("brn",sellerBrn.replaceAll("\\\\","").replaceAll("\"",""));
+		sellerMap.put("businessAddr",sellerAddr.replaceAll("\\\\","").replaceAll("\"",""));
+		sellerMap.put("businessPhoneNo",sellerPhone);
+		sellerMap.put("ebsCounterNo",branchCode);
+		sellerMap.put("cashierID",cashierID);
+		invMap.put("seller",sellerMap);
+		buyerMap = Map();
+		buyerMap.put("name",toString(ifnull(fullInv.get("customer_name"),"")).replaceAll("\\\\","").replaceAll("\"",""));
+		buyerMap.put("tan",tanValue);
+		buyerMap.put("brn",logBrn);
+		buyerMap.put("businessAddr",buyerAddr.replaceAll("\\\\","").replaceAll("\"",""));
+		buyerMap.put("buyerType",typeOfBuyer);
+		buyerMap.put("nic",nidValue.replaceAll("\\\\","").replaceAll("\"",""));
+		invMap.put("buyer",buyerMap);
+		invMap.put("itemList",itemList);
+		finalApiPayloadList = List();
+		finalApiPayloadList.add(invMap);
+		// Free text is sanitised at source, so the backslash strip below is a no-op (kept as in the live build).
+		finalPayload = "[" + finalApiPayloadList.toJSONList().replaceAll("\\\\","") + "]";
+		info "FINAL PAYLOAD: " + finalPayload;
+		response = invokeurl
+		[
+			url :apiEndpoint
+			type :POST
+			parameters:finalPayload.toString()
+			headers:{"Content-Type":"application/json","x-api-key":apiKey}
+		];
+		info "MRA API RESPONSE: " + response;
+		if(response != null && response.containsKey("fiscalisedInvoices") && response.get("fiscalisedInvoices").size() > 0)
+		{
+			result = response.get("fiscalisedInvoices").get(0);
+			if(result.get("status") == "SUCCESS")
+			{
+				irn = toString(ifnull(result.get("irn"),""));
+				info "DBG [13] SUCCESS: IRN=" + irn;
+				// Invoice custom fields (status + IRN; QR HTML for DRN)
+				cfUpd = List();
+				cfUpd.add({"api_name":"cf_fiscalization_status","value":STATUS_FISCALIZED});
+				cfUpd.add({"api_name":"cf_e_invoicing_irn","value":irn});
+				if(invoiceTypeDesc == "DRN")
+				{
+					qrHtml = "<img src=\"https://api.qrserver.com/v1/create-qr-code/?data=" + irn + "&size=90x90\" />";
+					cfUpd.add({"api_name":"cf_qr_code_html","value":qrHtml});
+				}
+				okBody = Map();
+				okBody.put("custom_fields",cfUpd);
+				okInvResp = invokeurl
+				[
+					url :posBase + "/invoices/" + invoiceID + "?organization_id=" + organizationID
+					type :PUT
+					parameters:okBody.toString()
+					headers:jsonHeaders
+					connection:"connectpos"
+				];
+				info "DBG [13] invoice status update: " + okInvResp.get("code") + " " + okInvResp.get("message");
+				// Chain service: mark fiscalised (final)
+				okOutcome = Map();
+				okOutcome.put("status","FISCALIZED");
+				okOutcome.put("irn",irn);
+				okOutcomeResp = invokeurl
+				[
+					url :CHAIN_SERVICE_URL + "/v1/transactions/" + toString(invoiceID) + "/outcome"
+					type :POST
+					parameters:okOutcome.toString()
+					headers:chainHeaders
+				];
+				info "DBG [13] chain service outcome: " + okOutcomeResp;
+				// Successful fiscalisation record
+				fisc = Map();
+				fisc.put("cf_invoice_number",logNumber);
+				fisc.put("cf_invoice_system_id",invoiceID);
+				fisc.put("cf_invoice_total_amount",logTotal);
+				fisc.put("cf_invoice_currency_code",currencyCode);
+				fisc.put("cf_previous_note_hash",logHash);
+				fisc.put("cf_invoice_date_time",logDateTime);
+				fisc.put("cf_irn",irn);
+				fisc.put("cf_brn",logBrn);
+				fisc.put("cf_invoice_status","FISCALISED");
+				fisc.put("cf_invoice_reference_identifier",invoiceRefNumberForPayload);
+				fiscResp = invokeurl
+				[
+					url :posBase + "/cm_successful_fiscalization?organization_id=" + organizationID
+					type :POST
+					parameters:fisc.toString()
+					headers:jsonHeaders
+					connection:"connectpos"
+				];
+				info "DBG [13] successful-fiscalisation record: " + fiscResp.get("code") + " " + fiscResp.get("message");
+				// Clear an earlier failure record (only a re-run can have one).
+				if(logExistedAtStart)
+				{
+					unfR = invokeurl
+					[
+						url :posBase + "/cm_failed_fiscalization?organization_id=" + organizationID + "&cf_invoice_system_id=" + invoiceID + "&per_page=5"
+						type :GET
+						connection:"connectpos"
+					];
+					unfList = ifnull(unfR.get("module_records"),List());
+					for each  ur in unfList
+					{
+						if(toString(ur.get("cf_invoice_system_id")) == toString(invoiceID))
+						{
+							delR = invokeurl
+							[
+								url :posBase + "/cm_failed_fiscalization/" + ur.get("module_record_id") + "?organization_id=" + organizationID
+								type :DELETE
+								connection:"connectpos"
+							];
+							info "DBG [13] cleared old failure record: " + delR.get("code") + " " + delR.get("message");
+							break;
+						}
+					}
+				}
+				stop = true;
+				stopMsg = logNumber + " SUCCESS: IRN " + irn + " (counter " + logCounter + ")";
+			}
+			else
+			{
+				info "DBG [13] MRA rejected: status=" + result.get("status");
+				errList = result.get("errorMessages");
+				if(errList != null && errList.size() > 0)
+				{
+					tmp = List();
+					for each  e in errList
+					{
+						tmp.add(ifnull(e.get("description"),""));
+					}
+					failErr = tmp.toString("; ");
+				}
+				else
+				{
+					failErr = "Fiscalisation failed (no error detail returned).";
+				}
+				failed = true;
+			}
+		}
+		else
+		{
+			failed = true;
+			failErr = "API returned no fiscalisedInvoices. If MRA may have received it, check before retrying.";
+		}
+	}
+
+	// ============ 14. OUTCOME ============
+	if(!stop && !failed)
+	{
+		failed = true;
+		failErr = "Unexpected state - nothing transmitted.";
+	}
+	resultHeader = "Fiscalization Result";
+	resultMsg = "";
+	if(stop)
+	{
+		info "RESULT: " + stopMsg;
+		resultHeader = if(irn != "","Fiscalization Successful","Fiscalization Skipped");
+		resultMsg = stopMsg;
+	}
+	else
+	{
+		// ---- FAILURE WRITE-BACK ----
+		if(logCounter == "")
+		{
+			failErr = failErr + " (Not logged - no chain position taken.)";
+		}
+		else
+		{
+			// Chain service: record the failure (the sale keeps its counter and hash for the retry).
+			failOutcome = Map();
+			failOutcome.put("status","FAILED");
+			failOutcome.put("error",failErr);
+			failOutcomeResp = invokeurl
+			[
+				url :CHAIN_SERVICE_URL + "/v1/transactions/" + toString(invoiceID) + "/outcome"
+				type :POST
+				parameters:failOutcome.toString()
+				headers:chainHeaders
+			];
+			info "DBG [14] chain service outcome: " + failOutcomeResp;
+		}
+		info "DBG [14] FAILED at stage '" + stage + "': " + failErr;
+		error1 = failErr;
+		error2 = "";
+		if(failErr.length() > 240)
+		{
+			error1 = failErr.left(240);
+			error2 = failErr.subString(240,failErr.length());
+			if(error2.length() > 240)
+			{
+				error2 = error2.left(240);
+			}
+		}
+		cfFail = List();
+		cfFail.add({"api_name":"cf_fiscalization_status","value":STATUS_FAILED});
+		cfFail.add({"api_name":"cf_e_invoicing_irn","value":""});
+		failBody = Map();
+		failBody.put("custom_fields",cfFail);
+		failInvResp = invokeurl
+		[
+			url :posBase + "/invoices/" + invoiceID + "?organization_id=" + organizationID
+			type :PUT
+			parameters:failBody.toString()
+			headers:jsonHeaders
+			connection:"connectpos"
+		];
+		info "DBG [14] invoice status update: " + failInvResp.get("code") + " " + failInvResp.get("message");
+		if(failInvResp.get("code") != 0)
+		{
+			info "DBG [14] -> set STATUS_FAILED at the top of this function to the exact dropdown option used for failures (currently '" + STATUS_FAILED + "').";
+		}
+		existingUnfisc = null;
+		retryStr = "0";
+		unfR = invokeurl
+		[
+			url :posBase + "/cm_failed_fiscalization?organization_id=" + organizationID + "&cf_invoice_system_id=" + invoiceID + "&per_page=5"
+			type :GET
+			connection:"connectpos"
+		];
+		unfList = ifnull(unfR.get("module_records"),List());
+		for each  ur in unfList
+		{
+			if(toString(ur.get("cf_invoice_system_id")) == toString(invoiceID))
+			{
+				existingUnfisc = ur.get("module_record_id");
+				retryStr = toString(ifnull(ur.get("cf_retry_count"),"0"));
+				break;
+			}
+		}
+		retry = if(retryStr.isNumber(),retryStr.toNumber() + 1,1);
+		unf = Map();
+		unf.put("cf_invoice_number",if(logNumber != "",logNumber,invoiceNumber));
+		unf.put("cf_invoice_system_id",invoiceID);
+		unf.put("cf_invoice_total_amount",if(logTotal != "",logTotal,invoiceTotal));
+		unf.put("cf_invoice_currency_code",currencyCode);
+		unf.put("cf_previous_note_hash",logHash);
+		unf.put("cf_invoice_date_time",logDateTime);
+		unf.put("cf_brn",if(logBrn != "",logBrn,brn));
+		unf.put("cf_invoice_status","UNFISCALISED");
+		unf.put("cf_invoice_reference_identifier",invoiceRefNumberForPayload);
+		unf.put("cf_retry_count",retry.toString());
+		unf.put("cf_last_attempted",zoho.currenttime.toString("yyyy-MM-dd HH:mm:ss"));
+		unf.put("cf_error_message",error1);
+		unf.put("cf_error_message_continued",error2);
+		if(existingUnfisc != null)
+		{
+			failRecResp = invokeurl
+			[
+				url :posBase + "/cm_failed_fiscalization/" + existingUnfisc + "?organization_id=" + organizationID
+				type :PUT
+				parameters:unf.toString()
+				headers:jsonHeaders
+				connection:"connectpos"
+			];
+		}
+		else
+		{
+			failRecResp = invokeurl
+			[
+				url :posBase + "/cm_failed_fiscalization?organization_id=" + organizationID
+				type :POST
+				parameters:unf.toString()
+				headers:jsonHeaders
+				connection:"connectpos"
+			];
+		}
+		info "DBG [14] failed-fiscalisation record: " + failRecResp.get("code") + " " + failRecResp.get("message");
+		info "RESULT: " + invoiceNumber + " FAILED at stage '" + stage + "': " + failErr;
+		resultHeader = "Fiscalization Failed";
+		resultMsg = invoiceNumber + " FAILED: " + failErr;
+	}
+	// ============ 15. RETURN (the function editor requires a Map) ============
+	resultMap = Map();
+	headerData = List();
+	listData = List();
+	headerData.add({"key":"Fiscalization_Result","value":resultHeader});
+	listData.add({"Fiscalization_Result":{"value":resultMsg}});
+	resultMap.put("header_context",headerData);
+	resultMap.put("data",listData);
+	resultMap.put("code",0);
+	return resultMap;
+}
